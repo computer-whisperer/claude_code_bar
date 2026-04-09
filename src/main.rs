@@ -4,8 +4,11 @@ use std::process::{Command, Stdio};
 use std::time::SystemTime;
 
 use serde::Deserialize;
+use unicode_width::UnicodeWidthChar;
 
-// ANSI color codes — matches the existing context-bar.sh "blue" theme.
+// ANSI color codes (matches the original context-bar.sh "blue" theme).
+// Diag work confirmed CC strips ANSI properly when measuring width — these
+// are safe to use without affecting the per-line budget.
 const RESET: &str = "\x1b[0m";
 const GRAY: &str = "\x1b[38;5;245m";
 const BAR_EMPTY: &str = "\x1b[38;5;238m";
@@ -15,6 +18,21 @@ const BAR_WIDTH: usize = 10;
 const DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
 // Conservative pre-conversation estimate: system prompt + tools + memory + framing.
 const BASELINE_TOKENS: u64 = 20_000;
+
+// Width budget. Empirically at term=101 the visible content area is ~80 cells
+// (term − Spindrizzle right-side art − padding). Row 1 gets an extra
+// reservation to dodge weekly-usage popups + effort-strength indicators that
+// only ever appear on the top row.
+const RIGHT_RESERVATION: usize = 21;
+const FIRST_LINE_EXTRA: usize = 60;
+const MIN_USABLE_WIDTH: usize = 20;
+const FALLBACK_TERM_WIDTH: usize = 80;
+
+// Diagnostic mode: if this marker file exists, ccbar emits a test pattern
+// instead of the normal status line and logs every invocation. Toggle with
+// `touch /tmp/ccbar_diag` / `rm /tmp/ccbar_diag` — no rebuild needed.
+const DIAG_MARKER: &str = "/tmp/ccbar_diag";
+const DIAG_LOG: &str = "/tmp/ccbar_diag.log";
 
 #[derive(Debug, Deserialize, Default)]
 struct Input {
@@ -65,14 +83,25 @@ fn main() {
         return;
     }
 
+    if std::path::Path::new(DIAG_MARKER).exists() {
+        run_diag_mode();
+        return;
+    }
+
     let parsed: Input = serde_json::from_str(&buf).unwrap_or_default();
 
-    let model_name = parsed
+    let model_raw = parsed
         .model
         .display_name
         .as_deref()
         .or(parsed.model.id.as_deref())
         .unwrap_or("?");
+    // Strip parenthetical context-window suffix: "Opus 4.6 (1M context)" → "Opus 4.6".
+    let model_name = model_raw
+        .split('(')
+        .next()
+        .unwrap_or(model_raw)
+        .trim();
 
     let cwd_str = parsed.cwd.as_deref().unwrap_or("");
     let dir = if cwd_str.is_empty() {
@@ -95,7 +124,6 @@ fn main() {
         .as_ref()
         .and_then(|cw| cw.context_window_size)
         .unwrap_or(DEFAULT_CONTEXT_WINDOW);
-    let max_k = max_context / 1000;
 
     let scan = parsed
         .transcript_path
@@ -106,31 +134,37 @@ fn main() {
     let (pct, pct_prefix) = compute_context_pct(scan.last_total_tokens, max_context);
     let bar = render_bar(pct);
 
-    let mut out = String::new();
-    out.push_str(ACCENT);
-    out.push_str(model_name);
-    out.push_str(GRAY);
-    out.push_str(" | 📁");
-    out.push_str(&dir);
+    let (first_budget, rest_budget) = line_budgets();
+    let separator = format!("{} | {}", GRAY, RESET);
+
+    // Order: most-useful (context) → mostly-static (dir) → state (git) →
+    // deprioritized (model). Model trails so it lands on the last wrap line.
+    let mut segments: Vec<String> = Vec::with_capacity(4);
+    segments.push(format!(
+        "{} {}{}{}% of {}{}",
+        bar,
+        GRAY,
+        pct_prefix,
+        pct,
+        format_token_count(max_context),
+        RESET
+    ));
+    segments.push(format!("{}📁{}{}", GRAY, dir, RESET));
     if let Some(g) = &git_info {
-        out.push_str(" | 🔀");
-        out.push_str(&g.branch);
-        out.push(' ');
-        out.push_str(&g.status);
+        segments.push(format!("{}🔀{} {}{}", GRAY, g.branch, g.status, RESET));
     }
-    out.push_str(" | ");
-    out.push_str(&bar);
-    out.push(' ');
-    out.push_str(GRAY);
-    out.push_str(pct_prefix);
-    out.push_str(&format!("{}% of {}k tokens", pct, max_k));
-    out.push_str(RESET);
-    println!("{}", out);
+    segments.push(format!("{}{}{}", ACCENT, model_name, RESET));
+
+    for line in wrap_segments(&segments, &separator, first_budget, rest_budget) {
+        println!("{}", line);
+    }
 
     if let Some(msg) = scan.last_user_message {
-        let plain_len = plain_status_len(model_name, &dir, git_info.as_ref(), pct, max_k);
-        let display = truncate(&msg, plain_len);
-        println!("💬 {}", display);
+        let prefix = "💬 ";
+        let prefix_w = visible_width(prefix);
+        let max_msg = rest_budget.saturating_sub(prefix_w);
+        let trimmed = truncate_to_width(&msg, max_msg);
+        println!("{}{}", prefix, trimmed);
     }
 }
 
@@ -153,14 +187,23 @@ fn gather_git_info(cwd: &str) -> Option<GitInfo> {
 
     let sync_status = compute_sync_status(cwd);
 
-    let status = if file_count == 0 {
-        format!("(0 files uncommitted, {})", sync_status)
-    } else if file_count == 1 {
+    // Build the parenthetical inner. For one dirty file, name it; for many,
+    // count them; for none, show sync only.
+    let mut parts: Vec<String> = Vec::new();
+    if file_count == 1 {
         // porcelain line is `XY filename`; strip the 3-char status prefix.
         let single = lines[0].get(3..).unwrap_or(lines[0]);
-        format!("({} uncommitted, {})", single, sync_status)
+        parts.push(single.to_string());
+    } else if file_count > 1 {
+        parts.push(format!("{} dirty", file_count));
+    }
+    if !sync_status.is_empty() {
+        parts.push(sync_status);
+    }
+    let status = if parts.is_empty() {
+        String::new()
     } else {
-        format!("({} files uncommitted, {})", file_count, sync_status)
+        format!("({})", parts.join(", "))
     };
 
     Some(GitInfo { branch, status })
@@ -214,13 +257,13 @@ fn fetch_head_age(cwd: &str) -> Option<String> {
 
 fn humanize_age(secs: u64) -> String {
     if secs < 60 {
-        "<1m ago".to_string()
+        "<1m".to_string()
     } else if secs < 3600 {
-        format!("{}m ago", secs / 60)
+        format!("{}m", secs / 60)
     } else if secs < 86400 {
-        format!("{}h ago", secs / 3600)
+        format!("{}h", secs / 3600)
     } else {
-        format!("{}d ago", secs / 86400)
+        format!("{}d", secs / 86400)
     }
 }
 
@@ -352,49 +395,302 @@ fn compute_context_pct(measured: Option<u64>, max_context: u64) -> (u64, &'stati
     }
 }
 
+/// Compact token count: 1_000_000 → "1M", 1_500_000 → "1.5M", 200_000 → "200k".
+fn format_token_count(n: u64) -> String {
+    if n >= 1_000_000 {
+        let m_int = n / 1_000_000;
+        let frac_tenths = (n % 1_000_000) / 100_000;
+        if frac_tenths == 0 {
+            format!("{}M", m_int)
+        } else {
+            format!("{}.{}M", m_int, frac_tenths)
+        }
+    } else if n >= 1_000 {
+        format!("{}k", n / 1_000)
+    } else {
+        n.to_string()
+    }
+}
+
 fn render_bar(pct: u64) -> String {
-    let pct = pct as i64;
+    // 8 sub-cells per character cell using Unicode left-block partials.
+    // BAR_WIDTH=10 → 80 levels of resolution across 0..100%.
+    const SUBCELLS_PER_CELL: u64 = 8;
+    let total = (BAR_WIDTH as u64) * SUBCELLS_PER_CELL;
+    let filled = (pct * total / 100).min(total);
+
     let mut bar = String::new();
-    for i in 0..BAR_WIDTH as i64 {
-        let bar_start = i * 10;
-        let progress = pct - bar_start;
-        if progress >= 8 {
+    for i in 0..(BAR_WIDTH as u64) {
+        let cell_start = i * SUBCELLS_PER_CELL;
+        let cell_end = cell_start + SUBCELLS_PER_CELL;
+        if filled >= cell_end {
             bar.push_str(ACCENT);
             bar.push('█');
             bar.push_str(RESET);
-        } else if progress >= 3 {
-            bar.push_str(ACCENT);
-            bar.push('▄');
-            bar.push_str(RESET);
-        } else {
+        } else if filled <= cell_start {
             bar.push_str(BAR_EMPTY);
             bar.push('░');
+            bar.push_str(RESET);
+        } else {
+            let sub = filled - cell_start;
+            let ch = match sub {
+                1 => '▏',
+                2 => '▎',
+                3 => '▍',
+                4 => '▌',
+                5 => '▋',
+                6 => '▊',
+                7 => '▉',
+                _ => '█',
+            };
+            bar.push_str(ACCENT);
+            bar.push(ch);
             bar.push_str(RESET);
         }
     }
     bar
 }
 
-// --- formatting helpers ----------------------------------------------------
+// --- width / wrap helpers --------------------------------------------------
 
-fn plain_status_len(model: &str, dir: &str, git: Option<&GitInfo>, pct: u64, max_k: u64) -> usize {
-    let mut s = format!("{} | 📁{}", model, dir);
-    if let Some(g) = git {
-        s.push_str(&format!(" | 🔀{} {}", g.branch, g.status));
+/// Visible cell width of `s`, ignoring ANSI CSI escape sequences.
+fn visible_width(s: &str) -> usize {
+    let mut width = 0usize;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Skip ESC [ ... <letter> (ANSI CSI sequence).
+            if let Some('[') = chars.next() {
+                for next in chars.by_ref() {
+                    if next.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else {
+            width += UnicodeWidthChar::width(c).unwrap_or(0);
+        }
     }
-    s.push_str(&format!(" | xxxxxxxxxx {}% of {}k tokens", pct, max_k));
-    s.chars().count()
+    width
 }
 
-fn truncate(s: &str, max_len: usize) -> String {
-    let count = s.chars().count();
-    if count <= max_len {
-        s.to_string()
-    } else {
-        let cutoff = max_len.saturating_sub(3);
-        let truncated: String = s.chars().take(cutoff).collect();
-        format!("{}...", truncated)
+/// Greedy reflow: pack `segments` into lines joined by `separator`. Line 1
+/// uses `first_budget`, every subsequent line uses `rest_budget`. A segment
+/// wider than its line's budget goes on its own line and may overflow.
+fn wrap_segments(
+    segments: &[String],
+    separator: &str,
+    first_budget: usize,
+    rest_budget: usize,
+) -> Vec<String> {
+    let sep_w = visible_width(separator);
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_w = 0usize;
+    let mut budget = first_budget;
+    for seg in segments {
+        let seg_w = visible_width(seg);
+        if current.is_empty() {
+            current.push_str(seg);
+            current_w = seg_w;
+        } else if current_w + sep_w + seg_w <= budget {
+            current.push_str(separator);
+            current.push_str(seg);
+            current_w += sep_w + seg_w;
+        } else {
+            lines.push(std::mem::take(&mut current));
+            budget = rest_budget;
+            current.push_str(seg);
+            current_w = seg_w;
+        }
     }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+/// Truncate `s` to at most `max` visible cells, appending `…` if it had to cut.
+fn truncate_to_width(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if visible_width(s) <= max {
+        return s.to_string();
+    }
+    let limit = max.saturating_sub(1); // reserve one cell for the ellipsis
+    let mut out = String::new();
+    let mut w = 0usize;
+    for c in s.chars() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if w + cw > limit {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out.push('…');
+    out
+}
+
+/// Visible-cell budgets for the first line and all subsequent lines.
+/// Row 1 gets extra reservation to dodge weekly-usage popups + the
+/// `● high · /effort` indicator that only ever appear on the top row.
+fn line_budgets() -> (usize, usize) {
+    let term_w = terminal_width()
+        .map(|w| w as usize)
+        .unwrap_or(FALLBACK_TERM_WIDTH);
+    let first = term_w
+        .saturating_sub(RIGHT_RESERVATION + FIRST_LINE_EXTRA)
+        .max(MIN_USABLE_WIDTH);
+    let rest = term_w
+        .saturating_sub(RIGHT_RESERVATION)
+        .max(MIN_USABLE_WIDTH);
+    (first, rest)
+}
+
+// --- terminal width --------------------------------------------------------
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+struct Winsize {
+    row: u16,
+    col: u16,
+    xpixel: u16,
+    ypixel: u16,
+}
+
+// Linux: TIOCGWINSZ = 0x5413, ioctl request type is unsigned long.
+const TIOCGWINSZ: u64 = 0x5413;
+
+unsafe extern "C" {
+    fn ioctl(fd: i32, request: u64, argp: *mut Winsize) -> i32;
+}
+
+/// Width of the controlling terminal in columns, or None if it can't be read.
+/// We open `/dev/tty` directly because stdout is a pipe in the status-line
+/// invocation context.
+fn terminal_width() -> Option<u16> {
+    use std::os::fd::AsRawFd;
+    let f = std::fs::File::open("/dev/tty").ok()?;
+    let mut ws = Winsize::default();
+    let r = unsafe { ioctl(f.as_raw_fd(), TIOCGWINSZ, &mut ws as *mut _) };
+    if r == 0 && ws.col > 0 {
+        Some(ws.col)
+    } else {
+        None
+    }
+}
+
+// --- diagnostic mode -------------------------------------------------------
+
+fn run_diag_mode() {
+    use std::io::Write;
+
+    let term = terminal_width();
+    let now = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let tag = now % 10_000;
+    let term_str = term
+        .map(|w| w.to_string())
+        .unwrap_or_else(|| "?".to_string());
+
+    let mut emitted: Vec<String> = Vec::with_capacity(7);
+
+    // R1: 20-cell row-1 candidate. Carries the tag so the user can read it
+    // off the screen and quote it back. Tests popup-safe row-1 width.
+    emitted.push(diag_pad(format!("R1 t={} tag={:04} ", term_str, tag), 20));
+
+    // R2-R4: 8-cell narrow rows. If all render but a wider row up top
+    // truncates, sub-row budgets are uniform (effort indicator is row-1 only).
+    // If R3/R4 also truncate, the indicator/popup clips multiple rows.
+    emitted.push(diag_pad("R2 ".to_string(), 8));
+    emitted.push(diag_pad("R3 ".to_string(), 8));
+    emitted.push(diag_pad("R4 ".to_string(), 8));
+
+    // R5: 20-cell emoji content. Tests CC's measurement of wide-cell chars.
+    emitted.push(diag_emoji_line(20));
+
+    // R6: 20-cell visible content wrapped in ANSI gray. Tests if CC counts
+    // ANSI escape bytes as visible cells.
+    let r6 = diag_pad("R6 ".to_string(), 20);
+    emitted.push(format!("{}{}{}", GRAY, r6, RESET));
+
+    // R7: 20-cell plain content. Control for R5 / R6.
+    emitted.push(diag_pad("R7 ".to_string(), 20));
+
+    for line in &emitted {
+        println!("{}", line);
+    }
+
+    // Append every invocation to the log so we can correlate with what the
+    // user reports seeing on screen.
+    let mut log = format!(
+        "=== ts={} tag={:04} term={:?} pid={} ===\n",
+        now,
+        tag,
+        term,
+        std::process::id()
+    );
+    for line in &emitted {
+        log.push_str(line);
+        log.push('\n');
+    }
+    log.push('\n');
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(DIAG_LOG)
+    {
+        let _ = f.write_all(log.as_bytes());
+    }
+}
+
+/// Pad `s` with `-` until it reaches `target - 1` cells, then append `]`.
+fn diag_pad(mut s: String, target: usize) -> String {
+    while visible_width(&s) < target - 1 {
+        s.push('-');
+    }
+    s.push(']');
+    s
+}
+
+/// Build a `target`-cell line filled with double-wide emoji glyphs.
+fn diag_emoji_line(target: usize) -> String {
+    let mut s = String::from("R5 ");
+    // Each emoji is 2 cells; stop before exceeding target - 1 (saves space for `]`).
+    while visible_width(&s) + 2 <= target - 1 {
+        s.push('📁');
+    }
+    while visible_width(&s) < target - 1 {
+        s.push('-');
+    }
+    s.push(']');
+    s
+}
+
+// --- ruler (kept for follow-up probes) -------------------------------------
+
+/// Build a column ruler `width` chars wide:
+/// - tens digits at multiples of 10 (cycles after col 99)
+/// - `+` at multiples of 5
+/// - `-` everywhere else
+#[allow(dead_code)] // kept for follow-up width probes
+fn ruler_line(width: usize) -> String {
+    let mut s = String::with_capacity(width);
+    for c in 0..width {
+        if c % 10 == 0 {
+            let tens = ((c / 10) % 10) as u32;
+            s.push(char::from_digit(tens, 10).unwrap());
+        } else if c % 5 == 0 {
+            s.push('+');
+        } else {
+            s.push('-');
+        }
+    }
+    s
 }
 
 // --- dump mode -------------------------------------------------------------
