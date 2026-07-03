@@ -76,10 +76,18 @@ comes from the `COLUMNS`/`LINES` env vars (see Width detection).
     without disturbing the rendered line. Idle past the ~5-min cache TTL, then
     send a turn, to capture a real miss and set `CACHE_MISS` on evidence.
 
-**Not pursued (by request):** `rate_limits` — user has a separate widget.
+- **Session-metrics cluster** (after the cache indicator): session cost
+  `$2.08` (`cost.total_cost_usd`), code churn `+107/-71`
+  (`cost.total_lines_added/removed`, green/red), and elapsed time `14m`
+  (`cost.total_duration_ms`). Plus a reasoning-effort indicator `● high`
+  (`effort.level`, accent when high) paired next to the model. Segment order:
+  bar, cache, cost, lines, age, dir, git, effort, model.
 
-**Available if wanted:** `effort.level`, `fast_mode`, `thinking.enabled`,
-session `cost`, `session_name`.
+**Not pursued (by request):** `rate_limits` — user has a separate widget;
+200k pricing-tier marker (`exceeds_200k_tokens`).
+
+**Available if wanted:** `fast_mode`, `thinking.enabled`, `session_name`,
+`version`; transcript-derived sub-agent count / files-touched / permission mode.
 
 ## Environment variables available
 

@@ -15,6 +15,7 @@ const BAR_EMPTY: &str = "\x1b[38;5;238m";
 const ACCENT: &str = "\x1b[38;5;74m";
 const YELLOW: &str = "\x1b[38;5;179m";
 const RED: &str = "\x1b[38;5;203m";
+const GREEN: &str = "\x1b[38;5;71m";
 
 const BAR_WIDTH: usize = 10;
 const DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
@@ -64,6 +65,28 @@ struct Input {
     transcript_path: Option<String>,
     #[serde(default)]
     context_window: Option<ContextWindow>,
+    #[serde(default)]
+    effort: Option<Effort>,
+    #[serde(default)]
+    cost: Option<Cost>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct Effort {
+    #[serde(default)]
+    level: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct Cost {
+    #[serde(default)]
+    total_cost_usd: Option<f64>,
+    #[serde(default)]
+    total_duration_ms: Option<u64>,
+    #[serde(default)]
+    total_lines_added: Option<u64>,
+    #[serde(default)]
+    total_lines_removed: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -187,7 +210,7 @@ fn main() {
 
     // Order: most-useful (context) → mostly-static (dir) → state (git) →
     // deprioritized (model). Model trails so it lands on the last wrap line.
-    let mut segments: Vec<String> = Vec::with_capacity(4);
+    let mut segments: Vec<String> = Vec::with_capacity(9);
     segments.push(format!(
         "{} {}{}{}% of {}{}",
         bar,
@@ -200,9 +223,24 @@ fn main() {
     if let Some(c) = cache_seg {
         segments.push(c);
     }
+    // Session metrics cluster: cost, code churn, elapsed time.
+    if let Some(cost) = &parsed.cost {
+        if let Some(s) = cost_segment(cost) {
+            segments.push(s);
+        }
+        if let Some(s) = lines_segment(cost) {
+            segments.push(s);
+        }
+        if let Some(s) = age_segment(cost) {
+            segments.push(s);
+        }
+    }
     segments.push(format!("{}📁{}{}", GRAY, dir, RESET));
     if let Some(g) = &git_info {
         segments.push(format!("{}🔀{} {}{}", GRAY, g.branch, g.status, RESET));
+    }
+    if let Some(s) = parsed.effort.as_ref().and_then(effort_segment) {
+        segments.push(s);
     }
     segments.push(format!("{}{}{}", ACCENT, model_name, RESET));
 
@@ -455,6 +493,40 @@ fn cache_segment(u: &CurrentUsage) -> Option<String> {
         format!("{}MISS {}%{}", RED, pct, RESET)
     };
     Some(seg)
+}
+
+/// Session cost so far, e.g. `$2.08`. None if CC didn't report a cost.
+fn cost_segment(cost: &Cost) -> Option<String> {
+    let usd = cost.total_cost_usd?;
+    Some(format!("{}${:.2}{}", GRAY, usd, RESET))
+}
+
+/// Code churn this session, e.g. `+107/-71` (green added / red removed). None
+/// when neither line count is present.
+fn lines_segment(cost: &Cost) -> Option<String> {
+    if cost.total_lines_added.is_none() && cost.total_lines_removed.is_none() {
+        return None;
+    }
+    let added = cost.total_lines_added.unwrap_or(0);
+    let removed = cost.total_lines_removed.unwrap_or(0);
+    Some(format!(
+        "{}+{}{}/{}-{}{}",
+        GREEN, added, RESET, RED, removed, RESET
+    ))
+}
+
+/// Elapsed session time, e.g. `14m`, from the cumulative duration.
+fn age_segment(cost: &Cost) -> Option<String> {
+    let ms = cost.total_duration_ms?;
+    Some(format!("{}{}{}", GRAY, humanize_age(ms / 1000), RESET))
+}
+
+/// Reasoning-effort indicator, e.g. `● high`. Accent when high (the costly
+/// setting), gray otherwise. None if CC didn't report a level.
+fn effort_segment(effort: &Effort) -> Option<String> {
+    let level = effort.level.as_deref()?;
+    let color = if level == "high" { ACCENT } else { GRAY };
+    Some(format!("{}● {}{}", color, level, RESET))
 }
 
 /// Append the latest turn's cache token breakdown to CACHE_LOG (calibration).
