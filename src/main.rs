@@ -239,11 +239,10 @@ fn main() {
     if let Some(g) = &git_info {
         segments.push(format!("{}🔀{} {}{}", GRAY, g.branch, g.status, RESET));
     }
+    segments.push(format!("{}{}{}", ACCENT, model_name, RESET));
     if let Some(s) = parsed.effort.as_ref().and_then(effort_segment) {
         segments.push(s);
     }
-    segments.push(format!("{}{}{}", ACCENT, model_name, RESET));
-
     for line in wrap_segments(&segments, &separator, first_budget, rest_budget) {
         println!("{}", line);
     }
