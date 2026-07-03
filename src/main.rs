@@ -13,18 +13,24 @@ const RESET: &str = "\x1b[0m";
 const GRAY: &str = "\x1b[38;5;245m";
 const BAR_EMPTY: &str = "\x1b[38;5;238m";
 const ACCENT: &str = "\x1b[38;5;74m";
+const YELLOW: &str = "\x1b[38;5;179m";
+const RED: &str = "\x1b[38;5;203m";
 
 const BAR_WIDTH: usize = 10;
 const DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
 // Conservative pre-conversation estimate: system prompt + tools + memory + framing.
 const BASELINE_TOKENS: u64 = 20_000;
 
-// Width budget. Empirically at term=101 the visible content area is ~80 cells
-// (term − Spindrizzle right-side art − padding). Row 1 gets an extra
-// reservation to dodge weekly-usage popups + effort-strength indicators that
-// only ever appear on the top row.
-const RIGHT_RESERVATION: usize = 21;
-const FIRST_LINE_EXTRA: usize = 60;
+// Width budget. Re-profiled 2026-07-03 on CC 2.1.200 after the "Spindrizzle"
+// buddy was retired: a width sweep at term=101 (via COLUMNS) rendered fully up
+// to w=97, so the hard right edge reserves 4 cells; we use 5 to balance the
+// left/right margins. CC also no longer cascade-drops rows below a truncated
+// one — overflow now clips each row individually — so FIRST_LINE_EXTRA is no
+// longer a safety measure, only popup-dodging on the top row: 24 cells of
+// slack keeps a modest top-row popup (e.g. the effort indicator) off our
+// content, and a rare wide popup now clips only the trailing `model` segment.
+const RIGHT_RESERVATION: usize = 5;
+const FIRST_LINE_EXTRA: usize = 24;
 const MIN_USABLE_WIDTH: usize = 20;
 const FALLBACK_TERM_WIDTH: usize = 80;
 
@@ -34,8 +40,22 @@ const FALLBACK_TERM_WIDTH: usize = 80;
 const DIAG_MARKER: &str = "/tmp/ccbar_diag";
 const DIAG_LOG: &str = "/tmp/ccbar_diag.log";
 
+// Cache-efficiency thresholds (input hit ratio). Provisional first-attempt
+// values — calibrate against a real miss captured via the cache log below.
+const CACHE_WARN: f64 = 0.98; // below → yellow
+const CACHE_MISS: f64 = 0.80; // below → red MISS alert
+
+// Passive calibration logger: if this marker exists, every normal render
+// appends the latest turn's cache token breakdown to CACHE_LOG. Off by
+// default; toggle with `touch /tmp/ccbar_cachelog` to collect samples
+// (including any misses) without disturbing the rendered status line.
+const CACHE_LOG_MARKER: &str = "/tmp/ccbar_cachelog";
+const CACHE_LOG: &str = "/tmp/ccbar_cache.log";
+
 #[derive(Debug, Deserialize, Default)]
 struct Input {
+    #[serde(default)]
+    session_id: Option<String>,
     #[serde(default)]
     model: Model,
     #[serde(default)]
@@ -58,6 +78,24 @@ struct Model {
 struct ContextWindow {
     #[serde(default)]
     context_window_size: Option<u64>,
+    // CC computes this for us (2.1.x); primary source for the context bar.
+    #[serde(default)]
+    used_percentage: Option<f64>,
+    // Latest assistant turn's token breakdown; source for the cache indicator.
+    #[serde(default)]
+    current_usage: Option<CurrentUsage>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct CurrentUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    cache_creation_input_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
 }
 
 struct GitInfo {
@@ -67,7 +105,6 @@ struct GitInfo {
 
 #[derive(Default)]
 struct TranscriptScan {
-    last_total_tokens: Option<u64>,
     last_user_message: Option<String>,
 }
 
@@ -84,7 +121,7 @@ fn main() {
     }
 
     if std::path::Path::new(DIAG_MARKER).exists() {
-        run_diag_mode();
+        run_diag_mode(&buf);
         return;
     }
 
@@ -131,8 +168,19 @@ fn main() {
         .and_then(scan_transcript)
         .unwrap_or_default();
 
-    let (pct, pct_prefix) = compute_context_pct(scan.last_total_tokens, max_context);
+    let (pct, pct_prefix) = compute_context_pct(parsed.context_window.as_ref(), max_context);
     let bar = render_bar(pct);
+
+    let current_usage = parsed
+        .context_window
+        .as_ref()
+        .and_then(|cw| cw.current_usage.as_ref());
+    if std::path::Path::new(CACHE_LOG_MARKER).exists() {
+        if let Some(u) = current_usage {
+            log_cache_sample(parsed.session_id.as_deref(), u);
+        }
+    }
+    let cache_seg = current_usage.and_then(cache_segment);
 
     let (first_budget, rest_budget) = line_budgets();
     let separator = format!("{} | {}", GRAY, RESET);
@@ -149,6 +197,9 @@ fn main() {
         format_token_count(max_context),
         RESET
     ));
+    if let Some(c) = cache_seg {
+        segments.push(c);
+    }
     segments.push(format!("{}📁{}{}", GRAY, dir, RESET));
     if let Some(g) = &git_info {
         segments.push(format!("{}🔀{} {}{}", GRAY, g.branch, g.status, RESET));
@@ -290,32 +341,9 @@ fn scan_transcript(path: &str) -> Option<TranscriptScan> {
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect();
 
-    let mut last_total: Option<u64> = None;
-    for v in &entries {
-        if v.get("isSidechain").and_then(|x| x.as_bool()) == Some(true) {
-            continue;
-        }
-        if v.get("isApiErrorMessage").and_then(|x| x.as_bool()) == Some(true) {
-            continue;
-        }
-        let Some(usage) = v.get("message").and_then(|m| m.get("usage")) else {
-            continue;
-        };
-        let input = usage
-            .get("input_tokens")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0);
-        let cache_read = usage
-            .get("cache_read_input_tokens")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0);
-        let cache_creation = usage
-            .get("cache_creation_input_tokens")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0);
-        last_total = Some(input + cache_read + cache_creation);
-    }
-
+    // Context tokens now come from stdin (`context_window.used_percentage` /
+    // `current_usage`), so the transcript is scanned only for the last user
+    // message shown on the 💬 line.
     let mut last_user: Option<String> = None;
     for v in entries.iter().rev() {
         if v.get("type").and_then(|x| x.as_str()) != Some("user") {
@@ -336,7 +364,6 @@ fn scan_transcript(path: &str) -> Option<TranscriptScan> {
     }
 
     Some(TranscriptScan {
-        last_total_tokens: last_total,
         last_user_message: last_user,
     })
 }
@@ -385,13 +412,77 @@ fn clean_message(s: &str) -> String {
 
 // --- context bar -----------------------------------------------------------
 
-fn compute_context_pct(measured: Option<u64>, max_context: u64) -> (u64, &'static str) {
-    if let Some(tokens) = measured.filter(|t| *t > 0) {
-        let pct = (tokens * 100 / max_context).min(100);
-        (pct, "")
+fn compute_context_pct(cw: Option<&ContextWindow>, max_context: u64) -> (u64, &'static str) {
+    // Primary: the percentage CC computes for us.
+    if let Some(p) = cw.and_then(|c| c.used_percentage).filter(|p| *p > 0.0) {
+        return (p.round().min(100.0) as u64, "");
+    }
+    // Fallback: derive from the latest turn's token breakdown.
+    if let Some(total) = cw
+        .and_then(|c| c.current_usage.as_ref())
+        .map(|u| u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens)
+        .filter(|t| *t > 0)
+    {
+        return ((total * 100 / max_context).min(100), "");
+    }
+    // Last resort: conservative pre-conversation estimate.
+    ((BASELINE_TOKENS * 100 / max_context).min(100), "~")
+}
+
+/// Fraction of the latest turn's input tokens served from the prompt cache.
+/// `None` when the turn had no input tokens to classify.
+fn cache_hit_ratio(u: &CurrentUsage) -> Option<f64> {
+    let denom = u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens;
+    if denom == 0 {
+        None
     } else {
-        let pct = (BASELINE_TOKENS * 100 / max_context).min(100);
-        (pct, "~")
+        Some(u.cache_read_input_tokens as f64 / denom as f64)
+    }
+}
+
+/// Compact cache-efficiency indicator for the latest turn. Shows the input hit
+/// ratio, quiet (gray) when warm; the label flips to a red `MISS` when the
+/// ratio drops — which happens when the prompt-cache TTL lapsed and CC had to
+/// re-create the whole prefix (cache_creation spikes, cache_read collapses).
+fn cache_segment(u: &CurrentUsage) -> Option<String> {
+    let ratio = cache_hit_ratio(u)?;
+    let pct = (ratio * 100.0).round() as u64;
+    let seg = if ratio >= CACHE_WARN {
+        format!("{}hit {}%{}", GRAY, pct, RESET)
+    } else if ratio >= CACHE_MISS {
+        format!("{}hit {}%{}", YELLOW, pct, RESET)
+    } else {
+        format!("{}MISS {}%{}", RED, pct, RESET)
+    };
+    Some(seg)
+}
+
+/// Append the latest turn's cache token breakdown to CACHE_LOG (calibration).
+/// Tagged with `session_id` so samples from parallel CC sessions (all appending
+/// to the one shared log) can be separated when calibrating.
+fn log_cache_sample(session_id: Option<&str>, u: &CurrentUsage) {
+    use std::io::Write;
+    let ratio = cache_hit_ratio(u).unwrap_or(0.0);
+    let now = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let line = format!(
+        "ts={} sid={} read={} create={} input={} out={} ratio={:.4}\n",
+        now,
+        session_id.unwrap_or("?"),
+        u.cache_read_input_tokens,
+        u.cache_creation_input_tokens,
+        u.input_tokens,
+        u.output_tokens,
+        ratio
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(CACHE_LOG)
+    {
+        let _ = f.write_all(line.as_bytes());
     }
 }
 
@@ -568,9 +659,21 @@ unsafe extern "C" {
 }
 
 /// Width of the controlling terminal in columns, or None if it can't be read.
-/// We open `/dev/tty` directly because stdout is a pipe in the status-line
-/// invocation context.
+///
+/// Primary source is the `COLUMNS` env var, which Claude Code exports into the
+/// status-line subprocess (observed in CC 2.1.x). The older `/dev/tty` ioctl
+/// path stopped working when CC dropped the controlling terminal for this
+/// subprocess (open fails with ENXIO), but we keep it as a fallback for
+/// environments that still provide one.
 fn terminal_width() -> Option<u16> {
+    if let Some(w) = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .filter(|w| *w > 0)
+    {
+        return Some(w);
+    }
+
     use std::os::fd::AsRawFd;
     let f = std::fs::File::open("/dev/tty").ok()?;
     let mut ws = Winsize::default();
@@ -582,51 +685,87 @@ fn terminal_width() -> Option<u16> {
     }
 }
 
+/// ioctl(TIOCGWINSZ) on a raw fd, reporting the result or the OS errno.
+fn ioctl_winsize(fd: i32) -> String {
+    let mut ws = Winsize::default();
+    let r = unsafe { ioctl(fd, TIOCGWINSZ, &mut ws as *mut _) };
+    if r == 0 {
+        format!("ok col={} row={}", ws.col, ws.row)
+    } else {
+        format!("FAIL rc={} errno={}", r, io::Error::last_os_error())
+    }
+}
+
+/// Diagnostic dump of every terminal-width channel and its failure reason.
+/// Written to the diag log so we can see, inside the real CC subprocess, which
+/// source (if any) yields the width.
+fn probe_width_sources() -> String {
+    use std::os::fd::AsRawFd;
+    let mut s = String::from("--- width sources ---\n");
+    // ioctl on the three standard fds (may be pipes under CC).
+    for (name, fd) in [("stdin(0)", 0), ("stdout(1)", 1), ("stderr(2)", 2)] {
+        s.push_str(&format!("ioctl {:<9} {}\n", name, ioctl_winsize(fd)));
+    }
+    // ioctl on /dev/tty (the current strategy).
+    match std::fs::File::open("/dev/tty") {
+        Ok(f) => s.push_str(&format!("/dev/tty open ok -> {}\n", ioctl_winsize(f.as_raw_fd()))),
+        Err(e) => s.push_str(&format!("/dev/tty open FAIL errno={}\n", e)),
+    }
+    // Environment channels.
+    for var in ["COLUMNS", "LINES", "TERM"] {
+        match std::env::var(var) {
+            Ok(v) => s.push_str(&format!("env {}={}\n", var, v)),
+            Err(_) => s.push_str(&format!("env {}=(unset)\n", var)),
+        }
+    }
+    s
+}
+
 // --- diagnostic mode -------------------------------------------------------
 
-fn run_diag_mode() {
+// Reservations to sweep, in cells subtracted from the terminal width. Ordered
+// large→small so rows go narrow→wide top→bottom: the LAST fully-visible row's
+// `r=NN` label is the true right-reservation. Range brackets both the old
+// buddy-era value (~21) and the expected post-buddy value (~2-6).
+const DIAG_SWEEP: &[usize] = &[24, 18, 14, 12, 10, 8, 6, 5, 4, 3, 2, 1, 0];
+
+fn run_diag_mode(stdin_raw: &str) {
     use std::io::Write;
 
     let term = terminal_width();
+    let term_w = term.map(|w| w as usize).unwrap_or(FALLBACK_TERM_WIDTH);
     let now = SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let tag = now % 10_000;
-    let term_str = term
-        .map(|w| w.to_string())
-        .unwrap_or_else(|| "?".to_string());
 
-    let mut emitted: Vec<String> = Vec::with_capacity(7);
+    let mut emitted: Vec<String> = Vec::with_capacity(DIAG_SWEEP.len() + 1);
 
-    // R1: 20-cell row-1 candidate. Carries the tag so the user can read it
-    // off the screen and quote it back. Tests popup-safe row-1 width.
-    emitted.push(diag_pad(format!("R1 t={} tag={:04} ", term_str, tag), 20));
+    // Row 1: short, always-fits anchor. Carries the measured terminal width and
+    // a tag the user can read off-screen and quote back. Kept narrow so a row-1
+    // popup can't clip it and cascade-drop the sweep below.
+    emitted.push(format!(
+        "DIAG term={} tag={:04}  read last full r= row",
+        term_w, tag
+    ));
 
-    // R2-R4: 8-cell narrow rows. If all render but a wider row up top
-    // truncates, sub-row budgets are uniform (effort indicator is row-1 only).
-    // If R3/R4 also truncate, the indicator/popup clips multiple rows.
-    emitted.push(diag_pad("R2 ".to_string(), 8));
-    emitted.push(diag_pad("R3 ".to_string(), 8));
-    emitted.push(diag_pad("R4 ".to_string(), 8));
-
-    // R5: 20-cell emoji content. Tests CC's measurement of wide-cell chars.
-    emitted.push(diag_emoji_line(20));
-
-    // R6: 20-cell visible content wrapped in ANSI gray. Tests if CC counts
-    // ANSI escape bytes as visible cells.
-    let r6 = diag_pad("R6 ".to_string(), 20);
-    emitted.push(format!("{}{}{}", GRAY, r6, RESET));
-
-    // R7: 20-cell plain content. Control for R5 / R6.
-    emitted.push(diag_pad("R7 ".to_string(), 20));
+    // Width sweep: each row is a ruler of exactly `term - NN` visible cells,
+    // labeled `r=NN` on the left and `w=<width>|` flush-right. Scanning down,
+    // the last row whose right `|` marker is intact fits the canvas; the first
+    // `…`-truncated row (and everything below it) is cascade-dropped. The
+    // ruler's tens-digit ticks show absolute columns, so the rightmost visible
+    // tick cross-checks the reservation (reservation = term − rightmost col).
+    for &nn in DIAG_SWEEP {
+        emitted.push(sweep_row(nn, term_w.saturating_sub(nn)));
+    }
 
     for line in &emitted {
         println!("{}", line);
     }
 
-    // Append every invocation to the log so we can correlate with what the
-    // user reports seeing on screen.
+    // Append every invocation to the log so on-screen truncation can be
+    // correlated with the exact bytes emitted (and their intended widths).
     let mut log = format!(
         "=== ts={} tag={:04} term={:?} pid={} ===\n",
         now,
@@ -634,9 +773,14 @@ fn run_diag_mode() {
         term,
         std::process::id()
     );
+    // Width-source probe: terminal_width() has been returning None under CC,
+    // so log every candidate channel and its exact failure reason.
+    log.push_str(&probe_width_sources());
+    // Raw stdin: newer CC versions may carry width/columns in the JSON.
+    log.push_str(&format!("--- stdin ({} bytes) ---\n{}\n", stdin_raw.len(), stdin_raw));
+    log.push_str("--- rows ---\n");
     for line in &emitted {
-        log.push_str(line);
-        log.push('\n');
+        log.push_str(&format!("[{:>3}] {}\n", visible_width(line), line));
     }
     log.push('\n');
     if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -648,49 +792,32 @@ fn run_diag_mode() {
     }
 }
 
-/// Pad `s` with `-` until it reaches `target - 1` cells, then append `]`.
-fn diag_pad(mut s: String, target: usize) -> String {
-    while visible_width(&s) < target - 1 {
-        s.push('-');
+/// Build one sweep row of exactly `width` visible cells: `r=NN ` on the left,
+/// ` w=<width>|` flush-right, and an absolute-column ruler filling the middle.
+/// If `width` is too small to hold both labels, returns a best-effort short row.
+fn sweep_row(nn: usize, width: usize) -> String {
+    let left = format!("r={:02} ", nn);
+    let right = format!(" w={}|", width);
+    let left_w = visible_width(&left);
+    let right_w = visible_width(&right);
+    if width <= left_w + right_w {
+        return truncate_to_width(&format!("r={:02} w={}", nn, width), width);
     }
-    s.push(']');
-    s
-}
-
-/// Build a `target`-cell line filled with double-wide emoji glyphs.
-fn diag_emoji_line(target: usize) -> String {
-    let mut s = String::from("R5 ");
-    // Each emoji is 2 cells; stop before exceeding target - 1 (saves space for `]`).
-    while visible_width(&s) + 2 <= target - 1 {
-        s.push('📁');
-    }
-    while visible_width(&s) < target - 1 {
-        s.push('-');
-    }
-    s.push(']');
-    s
-}
-
-// --- ruler (kept for follow-up probes) -------------------------------------
-
-/// Build a column ruler `width` chars wide:
-/// - tens digits at multiples of 10 (cycles after col 99)
-/// - `+` at multiples of 5
-/// - `-` everywhere else
-#[allow(dead_code)] // kept for follow-up width probes
-fn ruler_line(width: usize) -> String {
-    let mut s = String::with_capacity(width);
-    for c in 0..width {
-        if c % 10 == 0 {
-            let tens = ((c / 10) % 10) as u32;
-            s.push(char::from_digit(tens, 10).unwrap());
-        } else if c % 5 == 0 {
-            s.push('+');
+    let mid_w = width - left_w - right_w;
+    // Ticks reflect the absolute screen column (offset by the left label), so
+    // the rightmost readable tens digit tells the user the true cutoff column.
+    let mut mid = String::with_capacity(mid_w);
+    for i in 0..mid_w {
+        let col = left_w + i;
+        if col % 10 == 0 {
+            mid.push(char::from_digit(((col / 10) % 10) as u32, 10).unwrap());
+        } else if col % 5 == 0 {
+            mid.push('+');
         } else {
-            s.push('-');
+            mid.push('-');
         }
     }
-    s
+    format!("{}{}{}", left, mid, right)
 }
 
 // --- dump mode -------------------------------------------------------------
