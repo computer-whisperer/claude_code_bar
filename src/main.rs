@@ -157,11 +157,7 @@ fn main() {
         .or(parsed.model.id.as_deref())
         .unwrap_or("?");
     // Strip parenthetical context-window suffix: "Opus 4.6 (1M context)" → "Opus 4.6".
-    let model_name = model_raw
-        .split('(')
-        .next()
-        .unwrap_or(model_raw)
-        .trim();
+    let model_name = model_raw.split('(').next().unwrap_or(model_raw).trim();
 
     let cwd_str = parsed.cwd.as_deref().unwrap_or("");
     let dir = if cwd_str.is_empty() {
@@ -222,6 +218,11 @@ fn main() {
     ));
     if let Some(c) = cache_seg {
         segments.push(c);
+    }
+    // Wall-clock time of this render ≈ time of the last message. Handy for
+    // judging prompt-cache freshness (the cache TTL is ~5 min) at a glance.
+    if let Some(t) = time_segment() {
+        segments.push(t);
     }
     // Session metrics cluster: cost, code churn, elapsed time.
     if let Some(cost) = &parsed.cost {
@@ -520,6 +521,27 @@ fn age_segment(cost: &Cost) -> Option<String> {
     Some(format!("{}{}{}", GRAY, humanize_age(ms / 1000), RESET))
 }
 
+/// Local wall-clock time of this render, e.g. `🕐 14:32`. Rendered per turn, so
+/// it reflects roughly when the last message landed — a cheap reference for
+/// prompt-cache freshness. Shells out to `date` so timezone/DST come for free;
+/// None if `date` is unavailable or emits nothing usable.
+fn time_segment() -> Option<String> {
+    let out = Command::new("date")
+        .arg("+%H:%M")
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if t.is_empty() {
+        None
+    } else {
+        Some(format!("{}🕐 {}{}", GRAY, t, RESET))
+    }
+}
+
 /// Reasoning-effort indicator, e.g. `● high`. Accent when high (the costly
 /// setting), gray otherwise. None if CC didn't report a level.
 fn effort_segment(effort: &Effort) -> Option<String> {
@@ -779,7 +801,10 @@ fn probe_width_sources() -> String {
     }
     // ioctl on /dev/tty (the current strategy).
     match std::fs::File::open("/dev/tty") {
-        Ok(f) => s.push_str(&format!("/dev/tty open ok -> {}\n", ioctl_winsize(f.as_raw_fd()))),
+        Ok(f) => s.push_str(&format!(
+            "/dev/tty open ok -> {}\n",
+            ioctl_winsize(f.as_raw_fd())
+        )),
         Err(e) => s.push_str(&format!("/dev/tty open FAIL errno={}\n", e)),
     }
     // Environment channels.
@@ -848,7 +873,11 @@ fn run_diag_mode(stdin_raw: &str) {
     // so log every candidate channel and its exact failure reason.
     log.push_str(&probe_width_sources());
     // Raw stdin: newer CC versions may carry width/columns in the JSON.
-    log.push_str(&format!("--- stdin ({} bytes) ---\n{}\n", stdin_raw.len(), stdin_raw));
+    log.push_str(&format!(
+        "--- stdin ({} bytes) ---\n{}\n",
+        stdin_raw.len(),
+        stdin_raw
+    ));
     log.push_str("--- rows ---\n");
     for line in &emitted {
         log.push_str(&format!("[{:>3}] {}\n", visible_width(line), line));
@@ -928,7 +957,15 @@ fn dump_input(raw: &str) {
 
     println!();
     println!("=== environment (selected) ===");
-    for var in &["PWD", "USER", "HOME", "TERM", "SHELL", "LANG", "TERM_PROGRAM"] {
+    for var in &[
+        "PWD",
+        "USER",
+        "HOME",
+        "TERM",
+        "SHELL",
+        "LANG",
+        "TERM_PROGRAM",
+    ] {
         if let Ok(val) = std::env::var(var) {
             println!("{}={}", var, val);
         }
